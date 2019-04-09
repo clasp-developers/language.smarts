@@ -37,31 +37,51 @@
 (defrule bond-atom-pattern
     (and (? bond-pattern) atom-pattern)
   (:destructure (bond atom &bounds start end)
-    (bp:node* (:bond :kind (or bond :single) :bounds (cons start end))
+    (bp:node* (:bond :kind (or bond :single-or-aromatic) :bounds (cons start end))
       (1 :atom atom))))
 
-(defrule atom-pattern ; TODO duplicated from SMILES?
-    ;; The trailing integer is an atom map class, but in contrast to
-    ;; `language.simles.parser:atom-map-class', there is no #\:
-    ;; preceding the integer.
-    (and acyclic-atom-pattern (? smiles:atom-map-class/no-colon))
-  (:destructure (atom class &bounds start end)
-    (if class
-        (bp:node* (:binary-operator :operator :implicit-and
-                                    :bounds   (cons start end))
-          (1 :operand atom)
-          (1 :operand class))
+(defrule atom-pattern ; TODO duplicated form SMILES?
+    (and acyclic-atom-pattern (? parser.common-rules:integer-literal/decimal))
+  (:destructure (atom label &bounds start end)
+    (if label
+        (progn
+;;          (format t "atom-pattern got label |~s| of type |~s|~%" label (class-of label))
+          (bp:node* (:labeled :label label :bounds (cons start end))
+                                               (1 :atom atom)))
         atom)))
 
 (defrule acyclic-atom-pattern
-    (or modified-atom-pattern smiles:atom-symbol))
+    (or modified-atom-pattern wildcard-atom-pattern smiles:atom-symbol))
 
 (defrule modified-atom-pattern
-    (and #\[ weak-and-expression #\])
+    (and #\[ modified-weak-and-expression #\])
   (:function second)
   (:lambda (expression &bounds start end)
-    (bp:node* (:bracketed-expression :bounds (cons start end))
+    expression ; returning the expression eliminates useless log-identity nodes
+    #+(or)(bp:node* (:bracketed-expression :bounds (cons start end))
       (1 :expression expression))))
+
+(defrule modified-weak-and-expression
+    (or weak-and-expression-with-map weak-and-expression))
+
+(defrule weak-and-expression-with-map
+    (and weak-and-expression smiles:atom-map-class)
+  (:destructure (expression atom-map &bounds start end)
+                (bp:node* (:binary-operator :operator :weak-and :bounds (cons start end))
+                                                     (* :operand (list expression atom-map)))))
+
+
+
+(defrule lisp-func
+  (and #\< (esrap:character-ranges (#\a #\z) (#\A #\Z))
+       (* (or (esrap:character-ranges (#\a #\z) (#\A #\Z) (#\0 #\9))))
+       #\>)
+  (:lambda (symbol-parts &bounds start end)
+    (let* ((label (string-trim "<>" (esrap:text symbol-parts)))
+           (symbol (let ((*package* (find-package :keyword)))
+                     (read-from-string label))))
+      (bp:node* (:atom :lisp-function symbol
+                                                  :bounds (cons start end))))))
 
 ;;; SMARTS 4.1 Atomic Primitives
 
@@ -75,16 +95,24 @@
 (defrule modified-atom-pattern-body
     (or smiles:atom-weight ; TODO this is just a number, i.e. (node* ) is missing
         smiles:atom-symbol
-
+        lisp-func
+        
         ; smiles:hydrogen-count
         smiles:charge
         smiles:chirality
 
         atom-pattern/non-literal
 
-        smiles:atom-map-class
+;;; ------ smiles:atom-map-class can't be here it will be strong-and and it needs to be weak-and
+;;;        smiles:atom-map-class
 
         recursive))
+
+(defrule wildcard-atom-pattern
+  #\*
+  (:lambda (value &bounds start end)
+    (declare (ignore value))
+    (bp:node* (:atom :kind :wildcard :bounds (cons start end)))))
 
 (macrolet
     ((define-rules (&body clauses)
@@ -124,7 +152,7 @@
     (total-hydrogen-count    #\H :parameter &optional)
     (implicit-hydrogen-count #\h :parameter &optional)
     (ring-bond-count         #\R :parameter &optional)
-    ;; TODO allow x?
+    (ring-connectivity       #\x :parameter &optional) ;; TODO allow x?
     (smallest-ring-size      #\r :parameter &optional)
     (valence                 #\v :parameter t)
     (connectivity            #\X :parameter t)
@@ -132,10 +160,49 @@
 
 ;;; SMARTS 4.2 Bonds Primitives
 
+;;; original code without logicals
+#+(or)
 (defrule bond-pattern
     (or bond-pattern/non-literal smiles:bond))
 
-;;; Only additions to SMILES 3.2.2.
+;;; New code with logicals
+(defrule bond-pattern
+    (or modified-bond-pattern one-bond-pattern))
+
+(defrule modified-bond-pattern
+  (and weak-and-bond-expression)
+  (:lambda (expression &bounds start end)
+    (bp:node* (:logical-bond-expression :bounds (cons start end))
+                                         (1 :bond-expression expression))))
+
+;;; SMARTS 4.3 Logical Operators
+
+(macrolet ((define-operator-rule (name expression
+                                  &optional (value (make-keyword name)))
+             (let ((rule-name (symbolicate '#:operator- name)))
+               `(defrule ,rule-name
+                    ,expression
+                  (:constant ,value)))))
+  (define-operator-rule bond-weak-and     #\;   :bond-weak-and)
+  (define-operator-rule bond-or           #\,)
+  (define-operator-rule bond-strong-and   #\&   :bond-strong-and)
+  (define-operator-rule bond-not          #\!)
+  (define-operator-rule bond-implicit-and (and) :bond-implicit-and)) ; same as strong-and
+
+(parser.common-rules.operators:define-operator-rules
+    (:skippable?-expression nil)
+  (2 weak-and-bond-expression     operator-bond-weak-and)
+  (2 or-bond-expression           operator-bond-or)
+  (2 strong-and-bond-expression   operator-bond-strong-and)
+  (2 implicit-and-bond-expression operator-bond-implicit-and)
+  (1 not-bond-expression          operator-bond-not)
+  one-bond-pattern)
+
+
+(defrule one-bond-pattern
+    (or bond-pattern/non-literal smiles:bond))
+
+;;; Only additions to SMILES 3.2.2 and higher.
 (macrolet
     ((define-rules (&body clauses)
        (let ((rules '()))
@@ -153,7 +220,9 @@
   (define-rules
     (wildcard            #\~)
     (up-or-unspecified   "/?")
-    (down-or-unspecified "\\?")))
+    (down-or-unspecified "\\?")
+    (same-ring           #\@) ; added in smarts 4.6
+    ))
 
 ;;; SMARTS 4.3 Logical Operators
 
@@ -174,8 +243,8 @@
   (2 weak-and-expression     operator-weak-and)
   (2 or-expression           operator-or)
   (2 strong-and-expression   operator-strong-and)
-  (1 not-expression          operator-not)
   (2 implicit-and-expression operator-implicit-and)
+  (1 not-expression          operator-not)
   modified-atom-pattern-body)
 
 ;;; SMARTS 4.4 Recursive SMARTS
